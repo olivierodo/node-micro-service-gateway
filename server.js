@@ -1,52 +1,63 @@
-var config = require('./container-routes.js'),
+var config = require('config'),
 http = require('http'),
+extend = require('util')._extend,
 fs = require('fs'),
 httpProxy = require('http-proxy'),
 Docker = require('dockerode'),
 parseurl = require('parseurl');
 
-
-var docker = new Docker({
-  host: 'http://192.168.99.100',
-  port : 2376,
+// DEFINE THE DOCKER CONFIGURATION
+var host = 'http://' + (process.env.DOCKER_IP || '192.168.99.100'),
+docker = new Docker({
+  host: host,
+  port : process.env.DOCKER_PORT || 2376,
   ca: fs.readFileSync(process.env.DOCKER_CERT_PATH + '/ca.pem'),
   cert: fs.readFileSync(process.env.DOCKER_CERT_PATH + '/cert.pem'),
   key: fs.readFileSync(process.env.DOCKER_CERT_PATH + '/key.pem')
 });
 
-var dockerConfig, defaultContainer;
-for(var name in config) {
-  dockerConfig = config[name];
-  var ports = {};
-  ports[dockerConfig.port.exposed + '/tcp'] = [{ HostPort : dockerConfig.port.listen}]
-  docker.run(
-    dockerConfig.image,
-    [],
-    process.stdout,
-    {name:name},
-    {PortBindings:ports},
-    function (err, data, container) {
-      console.log(err, data, container);
-    }
-  );
-  if ('*' === dockerConfig.route) defaultContainer = name;
-}
+// CHECK AND START THE CONTAINERS BASED ON THE CONFIG FILE
+docker.listContainers({all:true},function(err, containers){
+   var routes = extend({},config.routes);
+  containers.forEach(function(container) {
+    if (-1===Object.keys(routes).indexOf(container.Names[0].substr(1))) return;
+    delete routes[container.Names[0].substr(1)];
+    docker.getContainer(container.Id).restart(function(){
+    });
+  });
 
-// create and start http server
-var proxy = httpProxy.createProxyServer();
-var server = http.createServer(function (req, res) {
-  var parsedUrl = parseurl(req);
-  var dockerConfig, containerToRedirect;
-  for(var name in config) {
-    dockerConfig = config[name];
+  for(var name in routes) {
+    var containerRoute = routes[name];
+
+    // Create container
+    var ports = {};
+    ports[containerRoute.port.exposed + '/tcp'] = [{ HostPort : containerRoute.port.listen}]
+    docker.run(
+      containerRoute.image,
+      [],
+      process.stdout,
+      {name:name},
+      {PortBindings:ports},
+      function (err, data, container) {
+        console.log(err, data, container);
+      }
+    );
+  }
+});
+
+// CREATE AND START HTTP SERVER
+var proxy = httpProxy.createProxyServer(),
+server = http.createServer(function (req, res) {
+  var parsedUrl = parseurl(req),
+  containerToRedirect;
+  for(var name in config.routes) {
+    var dockerConfig = config.routes[name];
     if ('*' !== dockerConfig.route && (new RegExp('^' + dockerConfig.route, 'i')).exec(parsedUrl.path)) {
       req.url = req.url.replace(dockerConfig.route, '');
       containerToRedirect = name;
     }
-    containerToRedirect = containerToRedirect || defaultContainer;
+    containerToRedirect = containerToRedirect || config.default_container;
   }
-  console.log(containerToRedirect);
-  return proxy.web(req, res, { target: 'http://192.168.99.100:' + config[containerToRedirect].port.listen});
+  return proxy.web(req, res, { target: host +  ':' + config.routes[containerToRedirect].port.listen});
 });
-server.listen(3000);
-
+server.listen(process.env.PORT || 3000);
